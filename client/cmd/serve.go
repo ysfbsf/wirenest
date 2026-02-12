@@ -2,190 +2,376 @@ package cmd
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"io"
+	"math/big"
 	"net"
-	"strconv"
-	"strings"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
 
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"google.golang.org/grpc/status"
-
-	"github.com/netbirdio/netbird/client/proto"
 )
 
 var (
-	serveProtocol string
 	servePort     uint32
+	serveProtocol string
+	serveAll      bool
 )
+
+func init() {
+	rootCmd.AddCommand(serveCmd)
+	serveCmd.AddCommand(serveStartCmd)
+	serveCmd.AddCommand(serveStopCmd)
+	serveCmd.AddCommand(serveStatusCmd)
+
+	serveStartCmd.Flags().Uint32Var(&servePort, "port", 0, "Port to listen on (required)")
+	serveStartCmd.Flags().StringVar(&serveProtocol, "proto", "http", "Protocol: http, https, or tcp")
+	_ = serveStartCmd.MarkFlagRequired("port")
+
+	serveStopCmd.Flags().Uint32Var(&servePort, "port", 0, "Port to stop serving")
+	serveStopCmd.Flags().BoolVar(&serveAll, "all", false, "Stop all serve configurations")
+}
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
-	Short: "Share a local service on the NetBird network",
-	Long:  "Commands to expose local services to other NetBird peers",
+	Short: "Expose local services to the NetBird network",
+	Long:  `Manage local service exposure to other peers on the NetBird network.`,
 }
 
 var serveStartCmd = &cobra.Command{
 	Use:     "start <target>",
-	Aliases: []string{"<target>"},
-	Short:   "Start sharing a local service",
-	Example: "  netbird serve start localhost:3000 --port 443 --proto https\n  netbird serve start 127.0.0.1:8080 --port 80 --proto http",
-	Long:    "Start exposing a local service to the NetBird network. The target should be in the format host:port.",
-	Args:    cobra.ExactArgs(1),
-	RunE:    serveStart,
+	Short:   "Start serving a local service",
+	Long:    `Start exposing a local service to the NetBird network.`,
+	Example: `  netbird serve start localhost:3000 --port 443 --proto https
+  netbird serve start 127.0.0.1:8080 --port 80 --proto http
+  netbird serve start localhost:5432 --port 5432 --proto tcp`,
+	Args: cobra.ExactArgs(1),
+	RunE: serveStartRun,
 }
 
 var serveStopCmd = &cobra.Command{
-	Use:     "stop",
-	Aliases: []string{"off"},
-	Short:   "Stop sharing services",
-	Example: "  netbird serve stop --port 443\n  netbird serve stop --all",
-	Long:    "Stop exposing services to the NetBird network.",
-	RunE:    serveStop,
+	Use:   "stop",
+	Short: "Stop serving",
+	Long:  `Stop exposing a local service.`,
+	Example: `  netbird serve stop --port 443
+  netbird serve stop --all`,
+	RunE: serveStopRun,
 }
 
 var serveStatusCmd = &cobra.Command{
-	Use:     "status",
-	Short:   "Show active serve configurations",
-	Example: "  netbird serve status",
-	Long:    "Show currently active serve configurations and their status.",
-	RunE:    serveStatus,
+	Use:   "status",
+	Short: "Show serve status",
+	Long:  `Show the status of all active serve configurations.`,
+	RunE:  serveStatusRun,
 }
 
-func init() {
-	serveStartCmd.Flags().Uint32VarP(&servePort, "port", "p", 0, "Port to serve on (required)")
-	serveStartCmd.Flags().StringVar(&serveProtocol, "proto", "http", "Protocol to use: http, https, or tcp")
-	serveStartCmd.MarkFlagRequired("port")
-
-	serveStopCmd.Flags().Uint32VarP(&servePort, "port", "p", 0, "Port to stop serving on")
-	serveStopCmd.Flags().Bool("all", false, "Stop all active serves")
-
-	serveCmd.AddCommand(serveStartCmd)
-	serveCmd.AddCommand(serveStopCmd)
-	serveCmd.AddCommand(serveStatusCmd)
+// serveState tracks active serve configurations (in-process, no daemon needed for MVP)
+type serveEntry struct {
+	Target   string
+	Port     uint32
+	Protocol string
+	listener net.Listener
+	cancel   context.CancelFunc
 }
 
-func serveStart(cmd *cobra.Command, args []string) error {
-	target := args[0]
-	
-	// Validate target format
-	if !strings.Contains(target, ":") {
-		return fmt.Errorf("target must be in format host:port, got: %s", target)
-	}
-	
-	// Validate protocol
-	if serveProtocol != "http" && serveProtocol != "https" && serveProtocol != "tcp" {
-		return fmt.Errorf("protocol must be one of: http, https, tcp")
-	}
-	
-	// Validate port
-	if servePort == 0 {
-		return fmt.Errorf("port is required")
-	}
-	
-	// Validate target is reachable
-	host, portStr, err := net.SplitHostPort(target)
+var (
+	activeServes   = make(map[uint32]*serveEntry)
+	activeServesMu sync.Mutex
+)
+
+func getNetBirdIP() (string, error) {
+	ifaces, err := net.Interfaces()
 	if err != nil {
-		return fmt.Errorf("invalid target format: %v", err)
+		return "", err
 	}
-	
-	if _, err := strconv.Atoi(portStr); err != nil {
-		return fmt.Errorf("invalid target port: %v", err)
-	}
-	
-	// For localhost/127.0.0.1, no need to check connectivity
-	if host != "localhost" && host != "127.0.0.1" {
-		conn, err := net.DialTimeout("tcp", target, cmd.Context().Done().Value().(context.Context).Value("timeout").(context.Duration))
-		if err == nil {
-			conn.Close()
+
+	for _, iface := range ifaces {
+		if iface.Name == "wt0" || iface.Name == "utun100" || iface.Name == "netbird" {
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				if ipnet, ok := addr.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+					return ipnet.IP.String(), nil
+				}
+			}
 		}
 	}
 
-	conn, err := getClient(cmd)
+	// Fallback: look for 100.x.y.z addresses on any interface
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok {
+				ip := ipnet.IP.To4()
+				if ip != nil && ip[0] == 100 && ip[1] >= 64 {
+					return ip.String(), nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("NetBird interface not found. Is NetBird running?")
+}
+
+func generateSelfSignedCert(ip string) (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: ip,
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP(ip)},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+func startHTTPServe(ctx context.Context, listenAddr, target string, port uint32, useTLS bool) (net.Listener, error) {
+	targetURL, err := url.Parse(fmt.Sprintf("http://%s", target))
+	if err != nil {
+		return nil, fmt.Errorf("invalid target: %v", err)
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	server := &http.Server{
+		Handler: proxy,
+	}
+
+	var listener net.Listener
+
+	if useTLS {
+		cert, err := generateSelfSignedCert(listenAddr[:len(listenAddr)-len(fmt.Sprintf(":%d", port))])
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate TLS certificate: %v", err)
+		}
+
+		tlsConfig := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+		}
+		listener, err = tls.Listen("tcp", listenAddr, tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start TLS listener: %v", err)
+		}
+	} else {
+		listener, err = net.Listen("tcp", listenAddr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to start listener: %v", err)
+		}
+	}
+
+	go func() {
+		<-ctx.Done()
+		server.Close()
+	}()
+
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Errorf("serve error: %v", err)
+		}
+	}()
+
+	return listener, nil
+}
+
+func startTCPServe(ctx context.Context, listenAddr, target string) (net.Listener, error) {
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start TCP listener: %v", err)
+	}
+
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					log.Errorf("accept error: %v", err)
+					continue
+				}
+			}
+			go handleTCPConn(conn, target)
+		}
+	}()
+
+	return listener, nil
+}
+
+func handleTCPConn(clientConn net.Conn, target string) {
+	defer clientConn.Close()
+
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		log.Errorf("failed to connect to target %s: %v", target, err)
+		return
+	}
+	defer targetConn.Close()
+
+	done := make(chan struct{}, 2)
+	go func() {
+		io.Copy(targetConn, clientConn)
+		done <- struct{}{}
+	}()
+	go func() {
+		io.Copy(clientConn, targetConn)
+		done <- struct{}{}
+	}()
+	<-done
+}
+
+func serveStartRun(cmd *cobra.Command, args []string) error {
+	target := args[0]
+
+	nbIP, err := getNetBirdIP()
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 
-	client := proto.NewDaemonServiceClient(conn)
-	_, err = client.ServeStart(cmd.Context(), &proto.ServeStartRequest{
+	listenAddr := fmt.Sprintf("%s:%d", nbIP, servePort)
+
+	activeServesMu.Lock()
+	if _, exists := activeServes[servePort]; exists {
+		activeServesMu.Unlock()
+		return fmt.Errorf("port %d is already being served", servePort)
+	}
+	activeServesMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	var listener net.Listener
+
+	switch serveProtocol {
+	case "http":
+		listener, err = startHTTPServe(ctx, listenAddr, target, servePort, false)
+	case "https":
+		listener, err = startHTTPServe(ctx, listenAddr, target, servePort, true)
+	case "tcp":
+		listener, err = startTCPServe(ctx, listenAddr, target)
+	default:
+		cancel()
+		return fmt.Errorf("unsupported protocol: %s (use http, https, or tcp)", serveProtocol)
+	}
+
+	if err != nil {
+		cancel()
+		return err
+	}
+
+	entry := &serveEntry{
 		Target:   target,
 		Port:     servePort,
 		Protocol: serveProtocol,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to start serving: %v", status.Convert(err).Message())
+		listener: listener,
+		cancel:   cancel,
 	}
 
-	cmd.Printf("Started serving %s on port %d via %s\n", target, servePort, serveProtocol)
+	activeServesMu.Lock()
+	activeServes[servePort] = entry
+	activeServesMu.Unlock()
+
+	cmd.Printf("Serving %s://%s → %s\n", serveProtocol, listenAddr, target)
+	cmd.Println("Press Ctrl+C to stop.")
+
+	// Wait for interrupt
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	cancel()
+	cmd.Println("\nStopped serving.")
 	return nil
 }
 
-func serveStop(cmd *cobra.Command, args []string) error {
-	all, _ := cmd.Flags().GetBool("all")
-	
-	if !all && servePort == 0 {
-		return fmt.Errorf("either --port or --all is required")
+func serveStopRun(cmd *cobra.Command, _ []string) error {
+	activeServesMu.Lock()
+	defer activeServesMu.Unlock()
+
+	if serveAll {
+		count := len(activeServes)
+		for port, entry := range activeServes {
+			entry.cancel()
+			delete(activeServes, port)
+		}
+		cmd.Printf("Stopped %d serve configuration(s).\n", count)
+		return nil
 	}
 
-	conn, err := getClient(cmd)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	client := proto.NewDaemonServiceClient(conn)
-	resp, err := client.ServeStop(cmd.Context(), &proto.ServeStopRequest{
-		Port: servePort,
-		All:  all,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to stop serving: %v", status.Convert(err).Message())
+	if servePort == 0 {
+		return fmt.Errorf("specify --port or --all")
 	}
 
-	if all {
-		cmd.Printf("Stopped all active serves (%d configurations)\n", resp.StoppedCount)
-	} else {
-		cmd.Printf("Stopped serving on port %d\n", servePort)
+	entry, exists := activeServes[servePort]
+	if !exists {
+		return fmt.Errorf("no serve configuration found for port %d", servePort)
 	}
+
+	entry.cancel()
+	delete(activeServes, servePort)
+	cmd.Printf("Stopped serving on port %d.\n", servePort)
 	return nil
 }
 
-func serveStatus(cmd *cobra.Command, args []string) error {
-	conn, err := getClient(cmd)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
+func serveStatusRun(cmd *cobra.Command, _ []string) error {
+	activeServesMu.Lock()
+	defer activeServesMu.Unlock()
 
-	client := proto.NewDaemonServiceClient(conn)
-	resp, err := client.ServeStatus(cmd.Context(), &proto.ServeStatusRequest{})
-	if err != nil {
-		return fmt.Errorf("failed to get serve status: %v", status.Convert(err).Message())
-	}
-
-	if len(resp.GetConfigurations()) == 0 {
+	if len(activeServes) == 0 {
 		cmd.Println("No active serve configurations.")
 		return nil
 	}
 
-	printServeConfigurations(cmd, resp.GetConfigurations())
-	return nil
-}
-
-func printServeConfigurations(cmd *cobra.Command, configs []*proto.ServeConfiguration) {
 	cmd.Println("Active serve configurations:")
 	cmd.Println()
-
-	for _, config := range configs {
-		status := "Running"
-		if !config.GetActive() {
-			status = "Stopped"
-		}
-		cmd.Printf("  %s:%d → %s (%s) [%s]\n", 
-			config.GetListenAddress(), 
-			config.GetPort(), 
-			config.GetTarget(), 
-			config.GetProtocol(), 
-			status)
+	for _, entry := range activeServes {
+		cmd.Printf("  %s://netbird-ip:%d → %s\n", entry.Protocol, entry.Port, entry.Target)
 	}
+	return nil
 }
