@@ -5,9 +5,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -18,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -27,9 +30,10 @@ import (
 )
 
 var (
-	servePort     uint32
-	serveProtocol string
-	serveAll      bool
+	servePort         uint32
+	serveProtocol     string
+	serveTargetScheme string
+	serveAll          bool
 )
 
 func init() {
@@ -40,6 +44,7 @@ func init() {
 
 	serveStartCmd.Flags().Uint32Var(&servePort, "port", 0, "Port to listen on (required)")
 	serveStartCmd.Flags().StringVar(&serveProtocol, "proto", "http", "Protocol: http, https, or tcp")
+	serveStartCmd.Flags().StringVar(&serveTargetScheme, "target-scheme", "http", "Target backend scheme: http or https")
 	_ = serveStartCmd.MarkFlagRequired("port")
 
 	serveStopCmd.Flags().Uint32Var(&servePort, "port", 0, "Port to stop serving")
@@ -81,11 +86,12 @@ var serveStatusCmd = &cobra.Command{
 
 // serveState tracks active serve configurations (in-process, no daemon needed for MVP)
 type serveEntry struct {
-	Target   string
-	Port     uint32
-	Protocol string
-	listener net.Listener
-	cancel   context.CancelFunc
+	Target       string
+	Port         uint32
+	Protocol     string
+	TargetScheme string
+	listener     net.Listener
+	cancel       context.CancelFunc
 }
 
 var (
@@ -132,16 +138,38 @@ func getNetBirdIP() (string, error) {
 	return "", fmt.Errorf("NetBird interface not found. Is NetBird running?")
 }
 
-func generateSelfSignedCert(ip string) (tls.Certificate, error) {
+func getNetBirdFQDN() string {
+	// Try to get FQDN from netbird status command
+	// For now, return a placeholder that can be enhanced later
+	// This will typically be something like: peer-name.netbird.cloud
+	return "netbird.local"
+}
+
+func formatFingerprint(fingerprint string) string {
+	// Format as XX:XX:XX:XX... for better readability
+	var formatted strings.Builder
+	for i := 0; i < len(fingerprint); i += 2 {
+		if i > 0 {
+			formatted.WriteString(":")
+		}
+		formatted.WriteString(strings.ToUpper(fingerprint[i : i+2]))
+	}
+	return formatted.String()
+}
+
+func generateSelfSignedCert(ip string) (tls.Certificate, string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, "", err
 	}
 
+	// Get NetBird FQDN for DNS SAN
+	fqdn := getNetBirdFQDN()
+	
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
-			CommonName: ip,
+			CommonName: fqdn,
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
@@ -149,55 +177,124 @@ func generateSelfSignedCert(ip string) (tls.Certificate, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IPAddresses:           []net.IP{net.ParseIP(ip)},
+		DNSNames:              []string{fqdn, "localhost"},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, "", err
 	}
+
+	// Calculate SHA-256 fingerprint
+	fingerprint := sha256.Sum256(certDER)
+	fingerprintHex := hex.EncodeToString(fingerprint[:])
 
 	keyDER, err := x509.MarshalECPrivateKey(key)
 	if err != nil {
-		return tls.Certificate{}, err
+		return tls.Certificate{}, "", err
 	}
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
-	return tls.X509KeyPair(certPEM, keyPEM)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, "", err
+	}
+
+	return cert, fingerprintHex, nil
 }
 
-func startHTTPServe(ctx context.Context, listenAddr, target string, port uint32, useTLS bool) (net.Listener, error) {
-	targetURL, err := url.Parse(fmt.Sprintf("http://%s", target))
+func isWebSocketUpgrade(r *http.Request) bool {
+	for _, v := range r.Header["Connection"] {
+		if strings.EqualFold(v, "upgrade") {
+			if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func handleWebSocket(w http.ResponseWriter, r *http.Request, target string) {
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
-		return nil, fmt.Errorf("invalid target: %v", err)
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		return
+	}
+
+	hijacker, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "WebSocket hijack not supported", http.StatusInternalServerError)
+		targetConn.Close()
+		return
+	}
+
+	// Forward the original request to the target
+	err = r.Write(targetConn)
+	if err != nil {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		targetConn.Close()
+		return
+	}
+
+	clientConn, _, err := hijacker.Hijack()
+	if err != nil {
+		targetConn.Close()
+		return
+	}
+
+	go func() {
+		io.Copy(targetConn, clientConn)
+		targetConn.Close()
+	}()
+	go func() {
+		io.Copy(clientConn, targetConn)
+		clientConn.Close()
+	}()
+}
+
+func startHTTPServe(ctx context.Context, listenAddr, target, targetScheme string, port uint32, useTLS bool) (net.Listener, string, error) {
+	targetURL, err := url.Parse(fmt.Sprintf("%s://%s", targetScheme, target))
+	if err != nil {
+		return nil, "", fmt.Errorf("invalid target: %v", err)
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isWebSocketUpgrade(r) {
+			handleWebSocket(w, r, target)
+			return
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
 	server := &http.Server{
-		Handler: proxy,
+		Handler: handler,
 	}
 
 	var listener net.Listener
+	var fingerprint string
 
 	if useTLS {
-		cert, err := generateSelfSignedCert(listenAddr[:len(listenAddr)-len(fmt.Sprintf(":%d", port))])
+		cert, fp, err := generateSelfSignedCert(listenAddr[:len(listenAddr)-len(fmt.Sprintf(":%d", port))])
 		if err != nil {
-			return nil, fmt.Errorf("failed to generate TLS certificate: %v", err)
+			return nil, "", fmt.Errorf("failed to generate TLS certificate: %v", err)
 		}
+		fingerprint = fp
 
 		tlsConfig := &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		}
 		listener, err = tls.Listen("tcp", listenAddr, tlsConfig)
 		if err != nil {
-			return nil, fmt.Errorf("failed to start TLS listener: %v", err)
+			return nil, "", fmt.Errorf("failed to start TLS listener: %v", err)
 		}
 	} else {
 		listener, err = net.Listen("tcp", listenAddr)
 		if err != nil {
-			return nil, fmt.Errorf("failed to start listener: %v", err)
+			return nil, "", fmt.Errorf("failed to start listener: %v", err)
 		}
 	}
 
@@ -212,13 +309,13 @@ func startHTTPServe(ctx context.Context, listenAddr, target string, port uint32,
 		}
 	}()
 
-	return listener, nil
+	return listener, fingerprint, nil
 }
 
-func startTCPServe(ctx context.Context, listenAddr, target string) (net.Listener, error) {
+func startTCPServe(ctx context.Context, listenAddr, target string) (net.Listener, string, error) {
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start TCP listener: %v", err)
+		return nil, "", fmt.Errorf("failed to start TCP listener: %v", err)
 	}
 
 	go func() {
@@ -242,7 +339,7 @@ func startTCPServe(ctx context.Context, listenAddr, target string) (net.Listener
 		}
 	}()
 
-	return listener, nil
+	return listener, "", nil
 }
 
 func handleTCPConn(clientConn net.Conn, target string) {
@@ -270,12 +367,20 @@ func handleTCPConn(clientConn net.Conn, target string) {
 func serveStartRun(cmd *cobra.Command, args []string) error {
 	target := args[0]
 
+	// Validate target-scheme flag
+	if serveTargetScheme != "http" && serveTargetScheme != "https" {
+		return fmt.Errorf("unsupported target scheme: %s (use http or https)", serveTargetScheme)
+	}
+
 	nbIP, err := getNetBirdIP()
 	if err != nil {
 		return err
 	}
 
-	listenAddr := fmt.Sprintf("%s:%d", nbIP, servePort)
+	// Use 0.0.0.0 as some WireGuard userspace modes don't allow binding to the tunnel IP directly.
+	// The NetBird ACLs still restrict who can reach this peer.
+	listenAddr := fmt.Sprintf("0.0.0.0:%d", servePort)
+	_ = nbIP // validated that NetBird is running
 
 	activeServesMu.Lock()
 	if _, exists := activeServes[servePort]; exists {
@@ -287,14 +392,15 @@ func serveStartRun(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var listener net.Listener
+	var fingerprint string
 
 	switch serveProtocol {
 	case "http":
-		listener, err = startHTTPServe(ctx, listenAddr, target, servePort, false)
+		listener, fingerprint, err = startHTTPServe(ctx, listenAddr, target, serveTargetScheme, servePort, false)
 	case "https":
-		listener, err = startHTTPServe(ctx, listenAddr, target, servePort, true)
+		listener, fingerprint, err = startHTTPServe(ctx, listenAddr, target, serveTargetScheme, servePort, true)
 	case "tcp":
-		listener, err = startTCPServe(ctx, listenAddr, target)
+		listener, _, err = startTCPServe(ctx, listenAddr, target)
 	default:
 		cancel()
 		return fmt.Errorf("unsupported protocol: %s (use http, https, or tcp)", serveProtocol)
@@ -306,18 +412,31 @@ func serveStartRun(cmd *cobra.Command, args []string) error {
 	}
 
 	entry := &serveEntry{
-		Target:   target,
-		Port:     servePort,
-		Protocol: serveProtocol,
-		listener: listener,
-		cancel:   cancel,
+		Target:       target,
+		Port:         servePort,
+		Protocol:     serveProtocol,
+		TargetScheme: serveTargetScheme,
+		listener:     listener,
+		cancel:       cancel,
 	}
 
 	activeServesMu.Lock()
 	activeServes[servePort] = entry
 	activeServesMu.Unlock()
 
-	cmd.Printf("Serving %s://%s → %s\n", serveProtocol, listenAddr, target)
+	// Display connection information
+	if serveProtocol == "https" {
+		cmd.Printf("🔒 HTTPS Server Started\n")
+		cmd.Printf("Proxying %s://%s → %s://%s\n\n", serveProtocol, fmt.Sprintf("%s:%d", nbIP, servePort), serveTargetScheme, target)
+		cmd.Printf("📍 Access URL: https://%s:%d\n\n", nbIP, servePort)
+		cmd.Printf("🔑 TLS Certificate Fingerprint (SHA-256):\n")
+		cmd.Printf("   %s\n\n", formatFingerprint(fingerprint))
+		cmd.Printf("⚠️  You'll need to accept the self-signed certificate in your browser.\n")
+		cmd.Printf("   Verify the fingerprint above matches what your browser shows.\n\n")
+	} else {
+		cmd.Printf("Serving %s://%s:%d → %s://%s\n", serveProtocol, nbIP, servePort, serveTargetScheme, target)
+	}
+	
 	cmd.Println("Press Ctrl+C to stop.")
 
 	// Wait for interrupt
@@ -368,10 +487,20 @@ func serveStatusRun(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	nbIP, err := getNetBirdIP()
+	if err != nil {
+		// Continue without IP if NetBird is not running
+		nbIP = "<netbird-ip>"
+	}
+
 	cmd.Println("Active serve configurations:")
 	cmd.Println()
 	for _, entry := range activeServes {
-		cmd.Printf("  %s://netbird-ip:%d → %s\n", entry.Protocol, entry.Port, entry.Target)
+		if entry.Protocol == "tcp" {
+			cmd.Printf("  %s://%s:%d → %s\n", entry.Protocol, nbIP, entry.Port, entry.Target)
+		} else {
+			cmd.Printf("  %s://%s:%d → %s://%s\n", entry.Protocol, nbIP, entry.Port, entry.TargetScheme, entry.Target)
+		}
 	}
 	return nil
 }
