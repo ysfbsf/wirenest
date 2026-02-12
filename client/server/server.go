@@ -19,7 +19,6 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	gstatus "google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/netbirdio/netbird/client/internal/auth"
 	"github.com/netbirdio/netbird/client/internal/profilemanager"
@@ -29,7 +28,6 @@ import (
 
 	"github.com/netbirdio/netbird/client/internal"
 	"github.com/netbirdio/netbird/client/internal/peer"
-	"github.com/netbirdio/netbird/client/internal/serve"
 	"github.com/netbirdio/netbird/client/proto"
 	"github.com/netbirdio/netbird/version"
 )
@@ -91,8 +89,6 @@ type Server struct {
 	sleepTriggeredDown atomic.Bool
 
 	jwtCache *jwtCache
-
-	serveManager *serve.Manager
 }
 
 type oauthAuthFlow struct {
@@ -113,7 +109,6 @@ func New(ctx context.Context, logFile string, configFile string, profilesDisable
 		profilesDisabled:       profilesDisabled,
 		updateSettingsDisabled: updateSettingsDisabled,
 		jwtCache:               newJWTCache(),
-		serveManager:           serve.NewManager(""), // IP will be updated when client connects
 	}
 }
 
@@ -1549,112 +1544,6 @@ func (s *Server) GetFeatures(ctx context.Context, msg *proto.GetFeaturesRequest)
 	}
 
 	return features, nil
-}
-
-// ServeStart starts exposing a local service on the NetBird network
-func (s *Server) ServeStart(ctx context.Context, req *proto.ServeStartRequest) (*proto.ServeStartResponse, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if !s.clientRunning {
-		return nil, gstatus.Errorf(codes.FailedPrecondition, "NetBird client is not running")
-	}
-
-	if s.serveManager == nil {
-		return nil, gstatus.Errorf(codes.Internal, "serve manager is not initialized")
-	}
-
-	// Get the current NetBird IP from the status
-	status, err := s.statusRecorder.GetFullStatus()
-	if err != nil {
-		return nil, gstatus.Errorf(codes.Internal, "failed to get NetBird status: %v", err)
-	}
-
-	netbirdIP := status.LocalPeerState.IP
-	if netbirdIP == "" {
-		return nil, gstatus.Errorf(codes.FailedPrecondition, "NetBird interface IP not available")
-	}
-
-	// Update the serve manager's NetBird IP
-	s.serveManager.UpdateNetBirdIP(netbirdIP)
-
-	// Start the serve configuration
-	err = s.serveManager.Start(ctx, req.GetTarget(), req.GetPort(), req.GetProtocol())
-	if err != nil {
-		return nil, gstatus.Errorf(codes.InvalidArgument, "failed to start serve: %v", err)
-	}
-
-	return &proto.ServeStartResponse{}, nil
-}
-
-// ServeStop stops exposing services on the NetBird network
-func (s *Server) ServeStop(ctx context.Context, req *proto.ServeStopRequest) (*proto.ServeStopResponse, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if s.serveManager == nil {
-		return nil, gstatus.Errorf(codes.Internal, "serve manager is not initialized")
-	}
-
-	var stoppedCount int32
-	var err error
-
-	if req.GetAll() {
-		count, stopErr := s.serveManager.StopAll()
-		stoppedCount = int32(count)
-		err = stopErr
-	} else {
-		if req.GetPort() == 0 {
-			return nil, gstatus.Errorf(codes.InvalidArgument, "port must be specified when not using --all")
-		}
-		err = s.serveManager.Stop(req.GetPort())
-		if err == nil {
-			stoppedCount = 1
-		}
-	}
-
-	if err != nil {
-		return nil, gstatus.Errorf(codes.InvalidArgument, "failed to stop serve: %v", err)
-	}
-
-	return &proto.ServeStopResponse{
-		StoppedCount: stoppedCount,
-	}, nil
-}
-
-// ServeStatus returns the status of all serve configurations
-func (s *Server) ServeStatus(ctx context.Context, req *proto.ServeStatusRequest) (*proto.ServeStatusResponse, error) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if s.serveManager == nil {
-		return nil, gstatus.Errorf(codes.Internal, "serve manager is not initialized")
-	}
-
-	configs := s.serveManager.GetConfigurations()
-	
-	// Convert to proto configs
-	protoConfigs := make([]*proto.ServeConfiguration, 0, len(configs))
-	for _, config := range configs {
-		protoConfig := &proto.ServeConfiguration{
-			Target:        config.Target,
-			Port:          config.Port,
-			Protocol:      config.Protocol,
-			ListenAddress: config.ListenAddress,
-			Active:        config.Active,
-		}
-		
-		// Convert StartedAt to proto timestamp
-		if !config.StartedAt.IsZero() {
-			protoConfig.StartedAt = timestamppb.New(config.StartedAt)
-		}
-		
-		protoConfigs = append(protoConfigs, protoConfig)
-	}
-
-	return &proto.ServeStatusResponse{
-		Configurations: protoConfigs,
-	}, nil
 }
 
 func (s *Server) connect(ctx context.Context, config *profilemanager.Config, statusRecorder *peer.Status, doInitialAutoUpdate bool, runningChan chan struct{}) error {
