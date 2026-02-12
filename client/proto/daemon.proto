@@ -41,6 +41,11 @@ service DaemonService {
 
   rpc ForwardingRules(EmptyRequest) returns (ForwardingRulesResponse) {}
 
+  // Serve commands for exposing local services to the NetBird network
+  rpc ServeStart(ServeStartRequest) returns (ServeStartResponse) {}
+  rpc ServeStop(ServeStopRequest) returns (ServeStopResponse) {}
+  rpc ServeStatus(ServeStatusRequest) returns (ServeStatusResponse) {}
+
   // DebugBundle creates a debug bundle
   rpc DebugBundle(DebugBundleRequest) returns (DebugBundleResponse) {}
 
@@ -793,6 +798,39 @@ message StopCPUProfileRequest {}
 
 // StopCPUProfileResponse confirms CPU profiling has stopped
 message StopCPUProfileResponse {}
+
+// Serve messages for exposing local services to the NetBird network
+message ServeStartRequest {
+  string target = 1;   // Target service address (e.g., "localhost:3000")
+  uint32 port = 2;     // Port to expose on NetBird network
+  string protocol = 3; // Protocol: "http", "https", or "tcp"
+}
+
+message ServeStartResponse {}
+
+message ServeStopRequest {
+  uint32 port = 1;  // Port to stop serving on (0 if using 'all')
+  bool all = 2;     // Stop all active serves
+}
+
+message ServeStopResponse {
+  int32 stoppedCount = 1;  // Number of configurations stopped
+}
+
+message ServeStatusRequest {}
+
+message ServeStatusResponse {
+  repeated ServeConfiguration configurations = 1;
+}
+
+message ServeConfiguration {
+  string target = 1;        // Target service address
+  uint32 port = 2;         // Port being served on NetBird network  
+  string protocol = 3;     // Protocol being used
+  string listenAddress = 4; // NetBird interface IP where service listens
+  bool active = 5;         // Whether the serve is currently active
+  google.protobuf.Timestamp startedAt = 6; // When this serve was started
+}
 
 message InstallerResultRequest {
 }
